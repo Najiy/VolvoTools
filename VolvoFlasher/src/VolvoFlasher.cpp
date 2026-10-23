@@ -10,6 +10,7 @@
 #include <common/protocols/UDSPinFinder.hpp>
 #include <common/protocols/UDSRequest.hpp>
 #include <common/CanAlarmClock.hpp>
+#include <common/ChecksumHelper.hpp>
 #include <common/CommonData.hpp>
 #include <common/ProtocolType.hpp>
 #include <common/VBFParser.hpp>
@@ -36,10 +37,15 @@
 #include <common/LogHelper.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
+#include <sstream>
 #include <thread>
 #include <chrono>
 #include <iomanip>
@@ -56,7 +62,8 @@ enum class RunMode
 	Read,
 	Wakeup,
 	Pin,
-	Test
+	Test,
+	Devices
 };
 
 unsigned long hexStringToUlong(const std::string& str)
@@ -68,22 +75,231 @@ unsigned long hexStringToUlong(const std::string& str)
     return result;
 }
 
+const char* runModeName(RunMode mode)
+{
+    switch (mode) {
+    case RunMode::Flash: return "flash";
+    case RunMode::Read: return "read";
+    case RunMode::Wakeup: return "wakeup";
+    case RunMode::Pin: return "pin";
+    case RunMode::Test: return "test";
+    case RunMode::Devices: return "devices";
+    default: return "none";
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Machine-readable mode for the VolvoTools UI (--json).
+//
+// Structured output is one JSON object per line on stdout, each with a "type" member:
+// hello, devices, state, progress, plan and result (always last). The format is described in
+// docs/tech_specs/ui_json_protocol.md. Anything else that gets printed, such as library
+// logging, is plain text and is shown to the user as a log line.
+// ---------------------------------------------------------------------------------------------
+
+constexpr int kJsonProtocolVersion = 1;
+
+bool g_json = false;
+bool g_resultEmitted = false;
+int g_exitCode = 0;
+std::mutex g_jsonMutex;
+
+struct ExtraOptions {
+    std::string platform;  // -f as typed, echoed in the plan
+    std::string cmInfo;    // --cm-info: variant of the ECU software, for example me9_p1
+    bool dryRun = false;
+    std::string emitImage;
+};
+
+std::string jsonEscape(const std::string& text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (const unsigned char c : text) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                char buffer[8];
+                std::snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned>(c));
+                out += buffer;
+            }
+            else {
+                out += static_cast<char>(c);
+            }
+        }
+    }
+    return out;
+}
+
+std::string jsonString(const std::string& text)
+{
+    return "\"" + jsonEscape(text) + "\"";
+}
+
+const char* jsonBool(bool value)
+{
+    return value ? "true" : "false";
+}
+
+void emitJson(const std::string& line)
+{
+    std::lock_guard<std::mutex> lock(g_jsonMutex);
+    std::cout << line << std::endl;
+}
+
+void emitHello(const char* command)
+{
+    emitJson("{\"type\":\"hello\",\"protocol\":" + std::to_string(kJsonProtocolVersion) +
+        ",\"app\":\"VolvoFlasher\",\"version\":\"1.0\",\"command\":" + jsonString(command) + "}");
+}
+
+void emitResult(bool ok, const std::string& message)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_jsonMutex);
+        g_resultEmitted = true;
+    }
+    emitJson(std::string("{\"type\":\"result\",\"ok\":") + jsonBool(ok) + ",\"message\":" + jsonString(message) + "}");
+}
+
+const char* stateName(flasher::FlasherState state)
+{
+    using flasher::FlasherState;
+    switch (state) {
+    case FlasherState::Initial: return "Initial";
+    case FlasherState::OpenChannels: return "OpenChannels";
+    case FlasherState::FallAsleep: return "FallAsleep";
+    case FlasherState::Authorize: return "Authorize";
+    case FlasherState::ProgrammingSession: return "ProgrammingSession";
+    case FlasherState::LoadBootloader: return "LoadBootloader";
+    case FlasherState::StartBootloader: return "StartBootloader";
+    case FlasherState::RequestDownload: return "RequestDownload";
+    case FlasherState::EraseFlash: return "EraseFlash";
+    case FlasherState::WriteFlash: return "WriteFlash";
+    case FlasherState::CheckFlash: return "CheckFlash";
+    case FlasherState::ReadFlash: return "ReadFlash";
+    case FlasherState::WakeUp: return "WakeUp";
+    case FlasherState::CloseChannels: return "CloseChannels";
+    case FlasherState::Done: return "Done";
+    case FlasherState::Error: return "Error";
+    }
+    return "Unknown";
+}
+
+void emitState(flasher::FlasherState state)
+{
+    emitJson(std::string("{\"type\":\"state\",\"state\":\"") + stateName(state) + "\"}");
+}
+
+void emitProgress(size_t current, size_t maximum)
+{
+    emitJson("{\"type\":\"progress\",\"current\":" + std::to_string(current) +
+        ",\"max\":" + std::to_string(maximum) + "}");
+}
+
+void emitDevices(const std::vector<j2534::DeviceInfo>& devices)
+{
+    std::string line = "{\"type\":\"devices\",\"devices\":[";
+    for (size_t i = 0; i < devices.size(); ++i) {
+        if (i) {
+            line += ",";
+        }
+        line += "{\"name\":" + jsonString(devices[i].deviceName) +
+            ",\"library\":" + jsonString(devices[i].libraryName) + "}";
+    }
+    line += "]}";
+    emitJson(line);
+}
+
+// Last line of a hardware job: the legacy text, or the JSON result in --json mode.
+void reportResult(bool success, const std::string& okText, const std::string& failText)
+{
+    if (g_json) {
+        emitResult(success, success ? okText : failText);
+        if (!success) {
+            g_exitCode = 1;
+        }
+        return;
+    }
+    std::cout << std::endl << (success ? okText : failText) << std::endl;
+}
+
+void reportException(const std::string& what)
+{
+    if (g_json) {
+        emitResult(false, what);
+        g_exitCode = 1;
+    }
+}
+
+// Waits until a flasher or reader is done. Prints dots, or progress lines in --json mode.
+template<typename Worker>
+bool waitForCompletion(Worker& worker)
+{
+    size_t lastCurrent = static_cast<size_t>(-1);
+    size_t lastMaximum = static_cast<size_t>(-1);
+    const auto reportProgress = [&]() {
+        const size_t current = worker.getCurrentProgress();
+        const size_t maximum = worker.getMaximumProgress();
+        if (current != lastCurrent || maximum != lastMaximum) {
+            lastCurrent = current;
+            lastMaximum = maximum;
+            emitProgress(current, maximum);
+        }
+    };
+    while (worker.getCurrentState() != flasher::FlasherState::Done &&
+           worker.getCurrentState() != flasher::FlasherState::Error) {
+        if (g_json) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            reportProgress();
+        }
+        else {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::cout << ".";
+        }
+    }
+    if (g_json) {
+        reportProgress();
+    }
+    return worker.getCurrentState() == flasher::FlasherState::Done;
+}
+
 bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 	unsigned long& baudrate, std::string& flashPath, uint64_t& pin,
 	uint8_t& ecuId, unsigned long& start, unsigned long& datasize,
-	RunMode& runMode, std::string& sblPath, common::CarPlatform& carPlatform, bool& pinUpward, bool& verbose) {
+	RunMode& runMode, std::string& sblPath, common::CarPlatform& carPlatform, bool& pinUpward, bool& verbose,
+	ExtraOptions& extra) {
 	argparse::ArgumentParser program("VolvoFlasher", "1.0", argparse::default_arguments::help);
 	program.add_argument("-d", "--device").default_value(std::string{}).help("Device name");
-	program.add_argument("-b", "--baudrate").scan<'u', unsigned long>().default_value(500000u).help("CAN bus speed");
+	program.add_argument("-b", "--baudrate").scan<'u', unsigned long>().default_value(500000ul).help("CAN bus speed");
 	program.add_argument("-f", "--platform").default_value(std::string{ "P2" }).help("Car's platform, supported values: P80, P1, P1_UDS, P2, P2_250, P2_UDS, P3, SPA");
     program.add_argument("-e", "--ecu").default_value("7A").help("ECU id");
     program.add_argument("-p", "--pin").default_value("0x0").help("PIN to unlock ECU");
 	program.add_argument("-v", "--verbose").default_value(false).implicit_value(true).nargs(0).help("Enable verbose (debug) logging");
+	program.add_argument("--cm-info").default_value(std::string{}).help("Variant of the ECU software, selects the bootloader and flash layout, for example me9_p1");
+	program.add_argument("--json").default_value(false).implicit_value(true).nargs(0).help("Machine-readable output for the VolvoTools UI");
 
 	argparse::ArgumentParser flash_command("flash", "1.0", argparse::default_arguments::help);
 	flash_command.add_description("Flash BIN to ECU");
 	flash_command.add_argument("-i", "--input").help("File to flash");
 	flash_command.add_argument("-s", "--sbl").default_value(std::string()).help("File with SBL");
+	flash_command.add_argument("--dry-run").default_value(false).implicit_value(true).nargs(0).help("With --json: report what would be written and exit without touching the ECU");
+	flash_command.add_argument("--emit-image").default_value(std::string()).help("With --dry-run: write the image that would be sent to this file");
 
 	argparse::ArgumentParser read_command("read", "1.0", argparse::default_arguments::help);
 	read_command.add_description("Read BIN from ECU");
@@ -100,17 +316,22 @@ bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 
 	argparse::ArgumentParser wakeup_command("wakeup", "1.0", argparse::default_arguments::help);
 	wakeup_command.add_description("Wake up CAN network");
+	argparse::ArgumentParser devices_command("devices", "1.0", argparse::default_arguments::help);
+	devices_command.add_description("List installed J2534 devices");
 
 	program.add_subparser(flash_command);
 	program.add_subparser(read_command);
 	program.add_subparser(test_command);
 	program.add_subparser(pin_command);
 	program.add_subparser(wakeup_command);
+	program.add_subparser(devices_command);
 	try {
 		program.parse_args(argc, argv);
 		if (program.is_subcommand_used(flash_command)) {
 			flashPath = flash_command.get("-i");
 			sblPath = flash_command.get("-s");
+			extra.dryRun = flash_command.get<bool>("--dry-run");
+			extra.emitImage = flash_command.get<std::string>("--emit-image");
 			runMode = RunMode::Flash;
 		}
 		else if (program.is_subcommand_used(read_command)) {
@@ -129,16 +350,23 @@ bool getRunOptions(int argc, const char* argv[], std::string& deviceName,
 		else if (program.is_subcommand_used(wakeup_command)) {
 			runMode = RunMode::Wakeup;
 		}
+		else if (program.is_subcommand_used(devices_command)) {
+			runMode = RunMode::Devices;
+		}
 		else {
 			std::cout << program;
 			return false;
 		}
 		deviceName = program.get("-d");
-        baudrate = program.get<unsigned>("-b");
+        baudrate = program.get<unsigned long>("-b");
         ecuId = static_cast<uint8_t>(hexStringToUlong(program.get("-e")));
         carPlatform = common::parseCarPlatform(program.get<std::string>("-f"));
+		extra.platform = program.get<std::string>("-f");
+		std::transform(extra.platform.begin(), extra.platform.end(), extra.platform.begin(),
+			[](unsigned char c) { return static_cast<char>(std::toupper(c)); });
         pin = hexStringToUlong(program.get("-p"));
 		verbose = program.get<bool>("-v");
+		extra.cmInfo = program.get<std::string>("--cm-info");
 		return true;
 	}
 	catch (const std::exception& err) {
@@ -222,6 +450,10 @@ public:
 	}
 
     void OnState(flasher::FlasherState state) override {
+        if (g_json) {
+            emitState(state);
+            return;
+        }
         std::cout << std::endl;
         using flasher::FlasherState;
         switch(state) {
@@ -719,19 +951,8 @@ void UDSFlash(common::CarPlatform carPlatform, uint8_t ecuId,
 	FlasherCallback callback;
 	flasher.registerCallback(callback);
 	flasher.start();
-    while (flasher.getCurrentState() !=
-        flasher::FlasherState::Done && flasher.getCurrentState() !=
-        flasher::FlasherState::Error) {
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-		std::cout << ".";
-	}
-    const bool success = flasher.getCurrentState() ==
-        flasher::FlasherState::Done;
-	std::cout << std::endl
-		<< ((success)
-			? "Flashing done"
-			: "Flashing error. Try again.")
-		<< std::endl;
+	const bool success = waitForCompletion(flasher);
+	reportResult(success, "Flashing done", "Flashing error. Try again.");
 }
 
 common::VBF vbfForFlasher(const std::vector<uint8_t>& input)
@@ -755,18 +976,125 @@ void D2Flash(const std::string& flashPath, std::unique_ptr<j2534::J2534> j2534, 
 	FlasherCallback callback;
 	flasher.registerCallback(callback);
     flasher.start();
-    while (flasher.getCurrentState() !=
-               flasher::FlasherState::Done && flasher.getCurrentState() !=
-                  flasher::FlasherState::Error) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cout << ".";
+	const bool success = waitForCompletion(flasher);
+	reportResult(success, "Flashing done", "Flashing error. Try again.");
+}
+
+std::string hexString(unsigned value)
+{
+    std::ostringstream stream;
+    stream << std::uppercase << std::hex << value;
+    return stream.str();
+}
+
+// Flashes a binary image on a D2 ECU with the bootloader and flash layout that belong to
+// cmInfo, for example "me9_p1". The checksum correction and the list of areas to erase and
+// write come from loadVBFForFlasher, so what runs here is what flashDryRun reports.
+void D2FlashImage(common::CarPlatform carPlatform, uint8_t ecuId, const std::string& cmInfo,
+    const std::string& flashPath, std::unique_ptr<j2534::J2534> j2534)
+{
+    std::ifstream input(flashPath, std::ios_base::binary);
+    const common::VBF flash = common::loadVBFForFlasher(carPlatform, ecuId, cmInfo, flashPath, input);
+    flasher::SBLProviderCommon sblProviderCommon;
+    common::VBF bootloader = sblProviderCommon.getSBL(carPlatform, ecuId, cmInfo);
+    if (flash.chunks.empty()) {
+        reportResult(false, "", "The flash file is empty or could not be read");
+        return;
     }
-    std::cout << std::endl
-        << ((flasher.getCurrentState() ==
-            flasher::FlasherState::Done)
-			? "Flashing done"
-			: "Flashing error. Try again.")
-		<< std::endl;
+    // Without a bootloader the erase and write commands would go to the primary bootloader.
+    if (bootloader.chunks.empty()) {
+        reportResult(false, "", "There is no bootloader for this platform, ECU and --cm-info");
+        return;
+    }
+    flasher::D2FlasherConfig config{ std::move(bootloader), flash };
+    flasher::D2Flasher flasher(*j2534, carPlatform, ecuId, std::move(config));
+    FlasherCallback callback;
+    flasher.registerCallback(callback);
+    flasher.start();
+    const bool success = waitForCompletion(flasher);
+    reportResult(success, "Flashing done", "Flashing error. Try again.");
+}
+
+// Reports what a flash of this file would do and touches no hardware: the bootloader, the areas
+// to erase and write, how many bytes the checksum correction changed, and the checksum verdict
+// on the file as given. With extra.emitImage it also writes the exact image that would be sent
+// (0xFF outside the written areas) so a read-back can be compared against it.
+bool flashDryRun(common::CarPlatform carPlatform, uint8_t ecuId, const ExtraOptions& extra,
+    const std::string& flashPath)
+{
+    std::ifstream input(flashPath, std::ios_base::binary);
+    if (!input) {
+        emitResult(false, "Can't open " + flashPath);
+        return false;
+    }
+    const std::vector<uint8_t> original{ std::istreambuf_iterator<char>(input), {} };
+
+    std::vector<uint8_t> probe(original);
+    util::ChecksumHelper checksum(carPlatform, ecuId, common::toLower(extra.cmInfo));
+    const bool checksumSupported = checksum.isSupported(probe);
+    const bool checksumValid = checksumSupported && checksum.check(probe);
+    const size_t checkedBlocks = checksumSupported ? checksum.countCheckedBlocks(probe) : 0;
+
+    std::ifstream again(flashPath, std::ios_base::binary);
+    const common::VBF flash = common::loadVBFForFlasher(carPlatform, ecuId, extra.cmInfo, flashPath, again);
+    flasher::SBLProviderCommon sblProviderCommon;
+    const common::VBF bootloader = sblProviderCommon.getSBL(carPlatform, ecuId, extra.cmInfo);
+
+    // For .vbf and .hex files the input is not a flat image, so there is nothing to compare with.
+    const bool flatImage = flashPath.rfind(".vbf") == std::string::npos && flashPath.rfind(".hex") == std::string::npos;
+
+    std::ostringstream plan;
+    plan << "{\"type\":\"plan\",\"platform\":" << jsonString(extra.platform)
+         << ",\"ecu\":" << jsonString(hexString(ecuId))
+         << ",\"cmInfo\":" << jsonString(extra.cmInfo)
+         << ",\"fileSize\":" << original.size()
+         << ",\"checksum\":{\"supported\":" << jsonBool(checksumSupported)
+         << ",\"valid\":" << jsonBool(checksumValid)
+         << ",\"checkedBlocks\":" << checkedBlocks << "}"
+         << ",\"bootloader\":{\"call\":" << bootloader.header.call << ",\"chunks\":[";
+    for (size_t i = 0; i < bootloader.chunks.size(); ++i) {
+        plan << (i ? "," : "") << "{\"start\":" << bootloader.chunks[i].writeOffset
+             << ",\"length\":" << bootloader.chunks[i].data.size() << "}";
+    }
+    plan << "]},\"erase\":[";
+    for (size_t i = 0; i < flash.header.eraseBlocks.size(); ++i) {
+        plan << (i ? "," : "") << "{\"start\":" << flash.header.eraseBlocks[i].startAddr
+             << ",\"length\":" << flash.header.eraseBlocks[i].length << "}";
+    }
+    plan << "],\"chunks\":[";
+    for (size_t i = 0; i < flash.chunks.size(); ++i) {
+        const auto& chunk = flash.chunks[i];
+        size_t modified = 0;
+        if (flatImage && static_cast<size_t>(chunk.writeOffset) + chunk.data.size() <= original.size()) {
+            for (size_t b = 0; b < chunk.data.size(); ++b) {
+                if (chunk.data[b] != original[chunk.writeOffset + b]) {
+                    ++modified;
+                }
+            }
+        }
+        plan << (i ? "," : "") << "{\"start\":" << chunk.writeOffset << ",\"length\":" << chunk.data.size()
+             << ",\"modified\":" << modified << "}";
+    }
+    plan << "]}";
+    emitJson(plan.str());
+
+    if (!extra.emitImage.empty()) {
+        std::vector<uint8_t> image(original.size(), 0xFF);
+        for (const auto& chunk : flash.chunks) {
+            if (static_cast<size_t>(chunk.writeOffset) + chunk.data.size() <= image.size()) {
+                std::copy(chunk.data.begin(), chunk.data.end(), image.begin() + chunk.writeOffset);
+            }
+        }
+        std::ofstream out(extra.emitImage, std::ios_base::binary);
+        out.write(reinterpret_cast<const char*>(image.data()), image.size());
+        out.flush();
+        if (!out) {
+            emitResult(false, "Can't write " + extra.emitImage);
+            return false;
+        }
+    }
+    emitResult(true, "Dry run");
+    return true;
 }
 
 uint16_t crc16(const uint8_t* data_p, size_t length) {
@@ -793,45 +1121,44 @@ void fill_crc_map()
 	}
 }
 
-void readFlash(std::unique_ptr<j2534::J2534> j2534, common::CarPlatform carPlatform, uint8_t ecuId, const std::string& flashPath, unsigned long start, unsigned long datasize)
+void readFlash(std::unique_ptr<j2534::J2534> j2534, common::CarPlatform carPlatform, uint8_t ecuId, const std::string& cmInfo, const std::string& flashPath, unsigned long start, unsigned long datasize)
 {
     class CLIReaderProvider final : public flasher::ReaderParametersProviderBase {
     public:
-        CLIReaderProvider(common::CarPlatform platform, uint32_t id,
+        CLIReaderProvider(common::CarPlatform platform, uint32_t id, const std::string& cmInfo,
                           uint32_t s, size_t sz)
-            : ReaderParametersProviderBase(platform, id, "", std::make_unique<flasher::SBLProviderCommon>())
+            : ReaderParametersProviderBase(platform, id, cmInfo, std::make_unique<flasher::SBLProviderCommon>())
             , _range{ s, sz } {}
         flasher::ReadRanges getReadRanges() const override { return {_range}; }
     private:
         flasher::ReadRange _range;
     };
 
-    auto provider = CLIReaderProvider(carPlatform, ecuId,
+    auto provider = CLIReaderProvider(carPlatform, ecuId, cmInfo,
         static_cast<uint32_t>(start), static_cast<size_t>(datasize));
     auto reader = flasher::ReaderFactory::create(*j2534, provider);
     FlasherCallback callback;
     reader->registerCallback(callback);
     reader->start();
-    while (reader->getCurrentState() !=
-               flasher::FlasherState::Done && reader->getCurrentState() !=
-                  flasher::FlasherState::Error) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cout << ".";
+    bool success = waitForCompletion(*reader);
+    std::string failure = "Reading error. Try again.";
+    if (success) {
+        const auto& bin = reader->buffers()[0];
+        if (bin.size() != datasize) {
+            success = false;
+            failure = "The ECU returned " + std::to_string(bin.size()) + " bytes, expected " + std::to_string(datasize);
+        }
+        else {
+            std::fstream output(flashPath, std::ios_base::binary | std::ios_base::out);
+            output.write((const char*)bin.data(), bin.size());
+            output.flush();
+            if (!output) {
+                success = false;
+                failure = "Can't write " + flashPath;
+            }
+        }
     }
-    const bool success = reader->getCurrentState() ==
-        flasher::FlasherState::Done;
-	std::cout << std::endl
-		<< ((success)
-			? "Reading done"
-			: "Reading error. Try again.")
-		<< std::endl;
-	if (success)
-	{
-		std::fstream output(flashPath,
-			std::ios_base::binary | std::ios_base::out);
-		const auto& bin = reader->buffers()[0];
-		output.write((const char*)bin.data(), bin.size());
-	}
+    reportResult(success, "Reading done", failure);
 }
 
 std::vector<uint32_t> getCorrectPins(const uint8_t seed[3], const uint8_t key[3])
@@ -897,6 +1224,7 @@ BOOL WINAPI HandlerRoutine(_In_ DWORD dwCtrlType) {
 }
 
 int main(int argc, const char* argv[]) {
+    g_json = std::any_of(argv + 1, argv + argc, [](const char* arg) { return std::strcmp(arg, "--json") == 0; });
     common::initLogger("application.log");
     if (!SetConsoleCtrlHandler(HandlerRoutine, TRUE)) {
 		throw std::runtime_error("Can't set console control hander");
@@ -937,14 +1265,74 @@ int main(int argc, const char* argv[]) {
 	RunMode runMode = RunMode::None;
 	bool scanPinsUpward = true;
 	bool verbose = false;
+	ExtraOptions extra;
 	const auto devices = common::getAvailableDevices();
-	if (getRunOptions(argc, argv, deviceName, baudrate, flashPath, pin, ecuId, start, datasize, runMode, sblPath, carPlatform, scanPinsUpward, verbose)) {
+	if (getRunOptions(argc, argv, deviceName, baudrate, flashPath, pin, ecuId, start, datasize, runMode, sblPath, carPlatform, scanPinsUpward, verbose, extra)) {
         if (verbose) {
             common::initLogger("application.log", true, true);
         }
+		if (carPlatform == common::CarPlatform::P1 && ecuId == to_underlying(common::D2ECUType::ECM_ME) && extra.cmInfo.empty()) {
+			// The engine ECU of P1 is a Bosch ME9. Without this the ME7 bootloader would be used.
+			extra.cmInfo = "me9_p1";
+		}
+		if (g_json) {
+			emitHello(runModeName(runMode));
+		}
+		if (runMode == RunMode::Devices) {
+			if (g_json) {
+				emitDevices(devices);
+				emitResult(true, "");
+			}
+			else {
+				for (const auto& device : devices) {
+					std::cout << "    " << device.deviceName << std::endl;
+				}
+			}
+			return 0;
+		}
+		if (extra.dryRun) {
+			if (!g_json) {
+				std::cerr << "--dry-run needs --json" << std::endl;
+				return 1;
+			}
+			try {
+				return flashDryRun(carPlatform, ecuId, extra, flashPath) ? 0 : 1;
+			}
+			catch (const std::exception& ex) {
+				reportException(ex.what());
+				return 1;
+			}
+		}
+		// In --json mode the UI names exactly one adapter and only that one is used.
+		const j2534::DeviceInfo* jsonDevice = nullptr;
+		if (g_json) {
+			for (const auto& device : devices) {
+				if (device.deviceName == deviceName) {
+					jsonDevice = &device;
+					break;
+				}
+			}
+			if (!jsonDevice && !deviceName.empty()) {
+				for (const auto& device : devices) {
+					if (device.deviceName.find(deviceName) != std::string::npos) {
+						jsonDevice = &device;
+						break;
+					}
+				}
+			}
+			if (!jsonDevice) {
+				emitResult(false, deviceName.empty() ? "No J2534 device selected" : "No J2534 device matches " + deviceName);
+				return 1;
+			}
+		}
+		const auto selected = [&](const auto& device) {
+			if (g_json) {
+				return &device == jsonDevice;
+			}
+			return deviceName.empty() || device.deviceName.find(deviceName) != std::string::npos;
+		};
 		for (const auto& device : devices) {
-			if (deviceName.empty() ||
-				device.deviceName.find(deviceName) != std::string::npos) {
+			if (selected(device)) {
 				try {
 					std::string name =
 						device.deviceName.find("DiCE-") != std::string::npos
@@ -961,7 +1349,7 @@ int main(int argc, const char* argv[]) {
 						findPin2(*j2534, carPlatform, ecuId, pin, scanPinsUpward);
 					}
 					else if (runMode == RunMode::Read) {
-						readFlash(std::move(j2534), carPlatform, ecuId, flashPath, start, datasize);
+						readFlash(std::move(j2534), carPlatform, ecuId, extra.cmInfo, flashPath, start, datasize);
 					}
 					else if (runMode == RunMode::Flash) {
                         const auto ecuInfo{ common::getEcuInfoByEcuId(carPlatform, ecuId) };
@@ -969,7 +1357,12 @@ int main(int argc, const char* argv[]) {
                             UDSFlash(carPlatform, ecuId, std::move(j2534), baudrate, pin, flashPath, sblPath);
 						}
 						else {
-							D2Flash(flashPath, std::move(j2534), baudrate);
+							if (!extra.cmInfo.empty()) {
+								D2FlashImage(carPlatform, ecuId, extra.cmInfo, flashPath, std::move(j2534));
+							}
+							else {
+								D2Flash(flashPath, std::move(j2534), baudrate);
+							}
 						}
 					}
 					else if (runMode == RunMode::Test) {
@@ -979,23 +1372,33 @@ int main(int argc, const char* argv[]) {
 			catch (const std::exception& ex) {
 				std::cout << ex.what() << std::endl;
 				LOG_MODULE(ERROR) << "Exception: " << ex.what();
+				reportException(ex.what());
 				}
 				catch (const char* ex) {
 				std::cout << ex << std::endl;
 				LOG_MODULE(ERROR) << "Exception: " << ex;
+				reportException(ex);
 				}
 				catch (...) {
 				std::cout << "exception" << std::endl;
 				LOG_MODULE(ERROR) << "Unknown exception";
+				reportException("Unknown exception");
 				}
 			}
 		}
 	}
 	else {
+		if (g_json) {
+			emitResult(false, "Invalid command line, see the error output");
+			return 1;
+		}
 		std::cout << "Available J2534 devices:" << std::endl;
 		for (const auto& device : devices) {
 			std::cout << "    " << device.deviceName << std::endl;
 		}
 	}
-	return 0;
+	if (g_json && !g_resultEmitted) {
+		emitResult(true, "");
+	}
+	return g_json ? g_exitCode : 0;
 }

@@ -15,6 +15,9 @@ public:
 
     bool isSupported(const std::vector<uint8_t>& data) const;
     bool check(std::vector<uint8_t>& data) const;
+    // How many checksum records check() really evaluated. Zero means the scheme found nothing it
+    // understands in the image, so a passing check() proves nothing.
+    size_t countCheckedBlocks(std::vector<uint8_t>& data) const;
     void update(std::vector<uint8_t>& data) const;
 
 private:

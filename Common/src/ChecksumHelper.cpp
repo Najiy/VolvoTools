@@ -45,7 +45,7 @@ const std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> CheckBounds
     { 2048 * 1024, { { 0xA0000, 0xA0360 }, { 0x1C91E0, 0x1C9240 } } },
     };
 
-bool checkOrUpdateME7(std::vector<uint8_t>& data, bool update)
+bool checkOrUpdateME7(std::vector<uint8_t>& data, bool update, size_t* evaluated = nullptr)
 {
     const auto boundsIt{CheckBoundsME7.find(data.size())};
     if(boundsIt == CheckBoundsME7.cend()) {
@@ -62,6 +62,10 @@ bool checkOrUpdateME7(std::vector<uint8_t>& data, bool update)
 
             if (start_addr >= data.size() || end_addr >= data.size())
                 break;
+
+            if (evaluated) {
+                ++*evaluated;
+            }
 
             uint32_t checksum = 0;
             for (uint32_t addr = start_addr; addr < end_addr; addr += 2)
@@ -243,6 +247,26 @@ bool ChecksumHelper::isSupported(const std::vector<uint8_t>& data) const
 bool ChecksumHelper::check(std::vector<uint8_t>& data) const
 {
     return checkOrUpdateImpl(_carPlatform, _ecuId, _additionalData, data, false);
+}
+
+size_t ChecksumHelper::countCheckedBlocks(std::vector<uint8_t>& data) const
+{
+    switch(_carPlatform) {
+    case common::CarPlatform::P80:
+    case common::CarPlatform::P1:
+    case common::CarPlatform::P2:
+    case common::CarPlatform::P2_250:
+        if(_ecuId == 0x7A) {
+            size_t evaluated = 0;
+            checkOrUpdateME7(data, false, &evaluated);
+            return evaluated;
+        }
+        break;
+    default:
+        break;
+    }
+    // The other schemes read a fixed table and always evaluate it.
+    return isSupported(data) ? 1 : 0;
 }
 
 void ChecksumHelper::update(std::vector<uint8_t>& data) const
