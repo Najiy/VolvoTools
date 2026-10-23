@@ -55,6 +55,7 @@ Must be init'd after clone. All are read-only dependencies:
 | intelhex | static lib | `libintelhex/` | (standalone) |
 | **VolvoFlasher** | exe | `VolvoFlasher/src/VolvoFlasher.cpp` | Common, j2534, Flasher, argparse::argparse |
 | **VolvoLogger** | exe | `VolvoLogger/src/VolvoLogger.cpp` | Logger, Common, j2534, argparse::argparse |
+| **VolvoUI** | Tauri app (React + Rust) | `VolvoUI/` | drives `VolvoFlasher.exe --json`; not part of the CMake build |
 
 ## Architecture
 
@@ -63,7 +64,8 @@ Must be init'd after clone. All are read-only dependencies:
 - **Config data**: `Common/common/data.yaml` (~5k lines) — ECU parameters per platform, loaded at runtime
 - **Crypto keys**: `keys.cpp` at repo root
 - **ProtocolType** (`Common/common/ProtocolType.hpp`): `enum class ProtocolType : uint32_t` — типизированные константы `CAN`, `ISO15765`, `ISO14230`, `ISO9141`, `TP20`. Используется в `BusConfiguration.protocol`, `CanIdProvider`, фабрике каналов вместо `unsigned long` с J2534-константами.
-- **Tech specs** (13 docs in `docs/tech_specs/`): `transport_abstraction.md`, `d2_protocol_implementation.md`, `d2flasher_hfsm.md`, `d2_flasher_reader_common.md`, `ecu_reading.md`, `ISOTP.md`, `reader_flasher_params.md`, `restore_d2_transferdata_batching.md`, `code_logging_extension.md`, `pin_crack.md`, `can_id_provider.md`, `d2_request_parser_hardening.md`, `uds_partial_flash.md`
+- **Tech specs** (14 docs in `docs/tech_specs/`): `transport_abstraction.md`, `d2_protocol_implementation.md`, `d2flasher_hfsm.md`, `d2_flasher_reader_common.md`, `ecu_reading.md`, `ISOTP.md`, `reader_flasher_params.md`, `restore_d2_transferdata_batching.md`, `code_logging_extension.md`, `pin_crack.md`, `can_id_provider.md`, `d2_request_parser_hardening.md`, `uds_partial_flash.md`, `ui_json_protocol.md`
+- **VolvoUI** (`VolvoUI/`): Tauri v2 desktop app, React + TypeScript front end, Rust back end (`crates/volvo-core`). It never talks to the ECU itself: it runs `VolvoFlasher.exe --json` (spec: `docs/tech_specs/ui_json_protocol.md`, usage: `VolvoUI/README.md`). It owns the backup library and the safety gates for ME9 P1 (verified backup, flash plan check, checksum self-test, read-back). Not built by CMake.
 - **D2Request parser**: `docs/tech_specs/d2_request_parser_hardening.md` — защитный разбор ответов D2 (state machine в `D2Request::process`: валидация seriesId/заголовков с флагом серии `0x10`, лимиты серии, семантика skip/throw, формат ошибки)
 - **D2 framing**: `docs/tech_specs/d2_protocol_implementation.md` — заголовок кадра (`0x80` первый, `0x40` последний, `0x10` флаг серии, младший ниббл = `8+len` либо номер кадра серии), две базы нумерации (`0x08`/`0x10`), реальный обмен чтения VIN (`B9 FB` → CEM `0x50` на CAN HS)
 - **Partial UDS flash**: `docs/tech_specs/uds_partial_flash.md` — `UDSFlasherImpl::calculateBlocksToWrite()`: опрос CRC16 блоков (routine `0x31 01 FF 01`), итеративное замыкание «что стереть / что писать» до неподвижной точки, состояние HFSM `CheckFlash` между `StartBootloader` и `EraseFlash`, пересчёт максимума прогресса
@@ -82,15 +84,18 @@ Must be init'd after clone. All are read-only dependencies:
 
 ## CLI
 
-**VolvoFlasher** subcommands: `flash`, `read`, `pin`, `test`, `wakeup`
+**VolvoFlasher** subcommands: `flash`, `read`, `pin`, `test`, `wakeup`, `devices`
 ```
-VolvoFlasher [-d device] [-b baudrate] [-f platform] [-e ecu] [-p pin] <subcommand> [subcommand args]
-  flash  -i <input.bin> [-s <sbl_path>]
+VolvoFlasher [-d device] [-b baudrate] [-f platform] [-e ecu] [-p pin] [--cm-info variant] [--json] [-v] <subcommand> [subcommand args]
+  flash  -i <input.bin> [-s <sbl_path>] [--dry-run [--emit-image <file>]]
   read   -o <output> -s <start_addr> -sz <size>
   pin    [-d]              # -d = scan downward
   test                     # hardcoded VAG MED91 test
   wakeup                   # wake up CAN network (no args)
+  devices                  # list J2534 devices
 ```
+
+`--cm-info` picks the bootloader and flash layout, for example `me9_p1`; for `-f P1 -e 7A` it defaults to `me9_p1`. `--json` switches stdout to one JSON object per line (hello, devices, state, progress, plan, result), used by `VolvoUI`; `flash --dry-run` reports what would be written without opening a device. See `docs/tech_specs/ui_json_protocol.md`.
 
 **VolvoLogger** (no subcommands):
 ```
@@ -108,6 +113,8 @@ Only `Registry/RegistryTest/` exists — a standalone console app with custom `C
 Additional partial test content (not built by default — requires `-DBUILD_TESTS=ON`):
 - `Common/test/` — `D2MessageTest.cpp`, `D2RequestTest.cpp`
 - `Flasher/test/` — `D2FlasherTest.cpp`, `MockICanChannel.hpp`
+
+`VolvoUI/` has its own tests, independent of CMake: `cargo test --workspace` (unit tests and full workflows on a simulated flasher), `npm test`, and contract tests against a built VolvoFlasher: `VOLVOUI_FLASHER_EXE=... cargo test -p volvo-core --test real_flasher -- --ignored`
 
 ## Dependencies (Conan)
 

@@ -12,6 +12,7 @@ Now supports
 - ME9 flashing and logging for P1
 - ME9 and other UDS protocols flashing and logging
 - Denso ECM flashing and logging for Volvo P3 platform.
+- Desktop UI (Tauri, React and Rust) for backing up and flashing the P1 ME9 ECU, see `VolvoUI/README.md`.
 
 Big thanks to rkam for the information and shared data.
 Big thanks to jazdw for TP20 protocol explanation.
