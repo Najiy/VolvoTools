@@ -62,5 +62,3 @@ Big thanks to maZer.GTi for motivation.
 
 ## Тут нужно описать тонкости VAG TP20 с которыми столкнулся в рамках его реализации
 
-
-Build trigger for my C30 (P1 ME9).
