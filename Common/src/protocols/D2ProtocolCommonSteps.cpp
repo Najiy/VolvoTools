@@ -200,13 +200,16 @@ namespace {
             writeDataOffsetAndCheckAnswer(channel, ecuId, chunk.writeOffset);
             uint32_t endOffset =  chunk.writeOffset + chunk.data.size();
             uint8_t checksum = calculateCheckSum(chunk.data, 0, chunk.data.size());
+            // ECU may still be busy and send a late duplicate 0x9C reply: drop queued frames
+            // and accept the B1 answer among the next few frames (was: only 1 frame).
+            channel.clearRx();
             if (!writeMessagesAndCheckAnswer(
                     channel,
                     makeBootloaderFrame(ecuId, {0xB4, static_cast<uint8_t>((endOffset >> 24) & 0xFF),
                                                   static_cast<uint8_t>((endOffset >> 16) & 0xFF),
                                                   static_cast<uint8_t>((endOffset >> 8) & 0xFF),
                                                   static_cast<uint8_t>(endOffset & 0xFF)}),
-                    { 0xB1, checksum }))
+                    { 0xB1, checksum }, 5))
                 throw std::runtime_error("Failed. Checksums are not equal.");
             }
         LOG_MODULE(TRACE) << "transferData exit";
